@@ -24,6 +24,129 @@ function paymentRequired(req: NextRequest, product: NonNullable<ReturnType<typeo
   );
 }
 
+function safeUrlParts(rawUrl: string) {
+  try {
+    const parsed = new URL(rawUrl);
+    return {
+      normalized: parsed.toString(),
+      host: parsed.host,
+      protocol: parsed.protocol.replace(':', ''),
+      path: parsed.pathname || '/',
+      isHttps: parsed.protocol === 'https:',
+    };
+  } catch {
+    return {
+      normalized: rawUrl,
+      host: 'unknown',
+      protocol: 'unknown',
+      path: '/',
+      isHttps: false,
+    };
+  }
+}
+
+function productIdFromHost(host: string) {
+  return host
+    .toLowerCase()
+    .replace(/^www\./, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 48) || 'mcp-server';
+}
+
+function mcpAudit(url: string) {
+  const target = safeUrlParts(url);
+  const path = target.path.toLowerCase();
+  const transportHint = path.includes('sse')
+    ? 'sse'
+    : path.includes('mcp') || path.includes('rpc')
+      ? 'streamable-http-json-rpc'
+      : 'unknown-http';
+  const readinessScore = [
+    target.isHttps,
+    target.host !== 'unknown',
+    path.includes('mcp') || path.includes('rpc') || path.includes('sse'),
+  ].filter(Boolean).length;
+
+  return {
+    url: target.normalized,
+    host: target.host,
+    protocol: target.protocol,
+    transport_hint: transportHint,
+    monetization_readiness: {
+      score: readinessScore,
+      max_score: 3,
+      summary:
+        readinessScore >= 2
+          ? 'Ready for a thin paid-tool wrapper and catalog listing.'
+          : 'Needs endpoint discovery details before pricing can be finalized.',
+    },
+    recommended_paid_tools: [
+      {
+        name: 'search',
+        buyer_value: 'Return ranked results from the server with source metadata.',
+        suggested_price_usdc: '0.01-0.05',
+        cache_ttl_seconds: 300,
+      },
+      {
+        name: 'enrich',
+        buyer_value: 'Expand one input into structured entities, links, or scoring fields.',
+        suggested_price_usdc: '0.05-0.15',
+        cache_ttl_seconds: 900,
+      },
+      {
+        name: 'analyze',
+        buyer_value: 'Run the highest-cost reasoning/data path and return an agent-ready brief.',
+        suggested_price_usdc: '0.10-0.25',
+        cache_ttl_seconds: 1800,
+      },
+    ],
+    pricing_tiers: [
+      { tier: 'smoke-test', price_usdc: '0.01', use_case: 'cheap buyer-agent verification and catalog testing' },
+      { tier: 'standard-call', price_usdc: '0.05-0.10', use_case: 'normal paid MCP tool invocation' },
+      { tier: 'premium-analysis', price_usdc: '0.15-0.25', use_case: 'expensive model, data, or multi-step workflows' },
+    ],
+    x402_route_shape: {
+      unpaid: 'Return HTTP 402 with accepts[] metadata and X-PAYMENT-REQUIRED.',
+      paid: 'Verify X-PAYMENT or X-PAYMENT-TX, then return the normal MCP tool result.',
+      network: 'base',
+      asset: 'USDC',
+    },
+    pyrimid_listing: {
+      vendor_id: productIdFromHost(target.host),
+      product_id: `${productIdFromHost(target.host)}-mcp-access`,
+      category: 'devtools',
+      affiliate_bps: 4000,
+      endpoint: target.normalized,
+      output_schema: {
+        type: 'object',
+        properties: {
+          result: { type: 'object' },
+          routed_by: { const: 'pyrimid' },
+        },
+      },
+    },
+    integration_steps: [
+      'Map one high-value MCP tool to a deterministic HTTP endpoint.',
+      'Return x402 402 payment metadata before running paid compute.',
+      'Verify payment proof before invoking the tool handler.',
+      'Publish Pyrimid catalog metadata with price, affiliateBps, network, and output_schema.',
+      'Expose a no-spend smoke test so buyer agents can validate status and schema.',
+    ],
+    risk_checks: [
+      'Do not include API keys, bearer tokens, or private prompts in catalog metadata.',
+      'Keep paid responses deterministic enough for buyer-agent retries.',
+      'Rate-limit unpaid 402 probes separately from paid tool calls.',
+      'Log payment tx hashes and product ids without storing private user payloads.',
+    ],
+    validation_checks: [
+      'curl the endpoint without payment and confirm HTTP 402 plus accepts[].',
+      'query the Pyrimid catalog and confirm vendor_id/product_id/affiliate_bps are discoverable.',
+      'submit a mocked paid request in staging and confirm the MCP payload shape remains stable.',
+    ],
+  };
+}
+
 function payload(productId: string, req: NextRequest, proof: string) {
   const query = Object.fromEntries(req.nextUrl.searchParams.entries());
 
@@ -64,17 +187,14 @@ function payload(productId: string, req: NextRequest, proof: string) {
     }
     case 'mcp-server-audit': {
       const url = query.url || 'https://example.com/mcp';
+      const audit = mcpAudit(url);
       return {
         audit: {
-          url,
-          recommended_paid_tools: ['search', 'enrich', 'export', 'analyze'],
+          ...audit,
           pricing: '$0.01-$0.25 per call depending on compute/data cost',
-          integration_steps: [
-            'Add 402 response with x402 accepts[] metadata',
-            'Register vendor/product in Pyrimid catalog',
-            'Expose tool schema in MCP server card',
-            'Add affiliateBps for distribution agents',
-          ],
+          compatibility: {
+            recommended_paid_tools: audit.recommended_paid_tools.map((tool) => tool.name),
+          },
         },
       };
     }
